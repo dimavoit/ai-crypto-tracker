@@ -1,298 +1,271 @@
 /**
- * AI Crypto Tracker Bot v2.1
- * - Primary data source: Binance
- * - Fallback: CoinGecko (optional x-cg-demo-api-key)
- * - Russian UX, simple commands: /start, /price <SYMBOL>, /signal <SYMBOL>
+ * 🤖 AI Crypto Tracker Bot v3.0
+ * - Поддержка позиций
+ * - Binance primary API, CoinGecko fallback
+ * - Сигналы, P&L, баланс портфеля
+ * - Deploy на Render
  */
 
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const express = require('express');
+const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
+const express = require("express");
 
-// ---- Config -----------------------------------------------------------------
-const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const PORT = Number(process.env.PORT) || 10000;
+// ---------------- CONFIG -----------------
+const BOT_TOKEN = process.env.BOT_TOKEN || "YOUR_BOT_TOKEN_HERE";
+const PORT = process.env.PORT || 10000;
+const ADMIN_PASSWORD = process.env.ADMIN_PASS || "crypto123";
 
-axios.defaults.timeout = 8000;
-axios.defaults.headers.common['User-Agent'] = 'AI-Crypto-Tracker/2.1 (+render.com)';
+// ---------------- STATE -----------------
+const users = new Map();       // userId → user info
+const positions = new Map();   // posId → position
 
-const app = express();
-
-// ---- State (in-memory; for production use a DB) ------------------------------
-const users = new Map();
-
-// ---- Mappings ----------------------------------------------------------------
-const symbolMapping = {
-  'BTC': 'bitcoin',
-  'ETH': 'ethereum',
-  'SOL': 'solana',
-  'ADA': 'cardano',
-  'DOT': 'polkadot',
-  'MATIC': 'matic-network',
-  'LINK': 'chainlink',
-  'UNI': 'uniswap',
-  'AVAX': 'avalanche-2',
-  'ATOM': 'cosmos',
-  'XRP': 'ripple',
-  'DOGE': 'dogecoin',
-  'LTC': 'litecoin',
-  'BCH': 'bitcoin-cash'
-};
-
-// Binance trading pairs vs USDT
+// Binance trading pairs
 const binancePair = {
-  BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT', ADA: 'ADAUSDT',
-  DOT: 'DOTUSDT', MATIC: 'MATICUSDT', LINK: 'LINKUSDT', UNI: 'UNIUSDT',
-  AVAX: 'AVAXUSDT', ATOM: 'ATOMUSDT', XRP: 'XRPUSDT', DOGE: 'DOGEUSDT',
-  LTC: 'LTCUSDT', BCH: 'BCHUSDT'
+  BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", ADA: "ADAUSDT",
+  DOT: "DOTUSDT", MATIC: "MATICUSDT", LINK: "LINKUSDT", UNI: "UNIUSDT",
+  AVAX: "AVAXUSDT", ATOM: "ATOMUSDT", XRP: "XRPUSDT", DOGE: "DOGEUSDT",
+  LTC: "LTCUSDT", BCH: "BCHUSDT"
 };
 
-// ---- Helpers -----------------------------------------------------------------
-function round(value, decimals = 2) {
-  if (value === null || value === undefined || isNaN(value)) return 0;
-  const d = Math.pow(10, decimals);
-  return Math.round(value * d) / d;
+// CoinGecko mapping
+const symbolMapping = {
+  BTC: "bitcoin", ETH: "ethereum", SOL: "solana", ADA: "cardano",
+  DOT: "polkadot", MATIC: "matic-network", LINK: "chainlink", UNI: "uniswap",
+  AVAX: "avalanche-2", ATOM: "cosmos", XRP: "ripple", DOGE: "dogecoin",
+  LTC: "litecoin", BCH: "bitcoin-cash"
+};
+
+// ---------------- HELPERS ----------------
+function round(v, d = 2) {
+  return Math.round(v * Math.pow(10, d)) / Math.pow(10, d);
 }
 
-function computeMetricsFromSeries(prices, volumes, currentPrice, change24h, volume24h) {
-  if (!Array.isArray(prices) || prices.length === 0) return null;
-
-  const high7d = Math.max(...prices);
-  const low7d = Math.min(...prices);
-
+function calcVolatility(prices) {
   const returns = [];
   for (let i = 1; i < prices.length; i++) {
-    const prev = prices[i - 1];
-    const cur = prices[i];
-    if (prev > 0) {
-      const r = (cur - prev) / prev;
-      if (Number.isFinite(r)) returns.push(r);
-    }
+    const r = (prices[i] - prices[i - 1]) / prices[i - 1];
+    if (Number.isFinite(r)) returns.push(r);
   }
-  const variance = returns.reduce((a, b) => a + b * b, 0) / Math.max(1, returns.length);
-  const volatility = Math.sqrt(variance) * Math.sqrt(365) * 100;
-
-  const avgVolume = volumes && volumes.length
-    ? volumes.reduce((a, b) => a + b, 0) / volumes.length
-    : 0;
-
-  return {
-    price: currentPrice,
-    change24h: change24h,
-    volume24h: volume24h,
-    high7d, low7d,
-    volatility,
-    avgVolume,
-    support: low7d * 1.02,     // +2% от недельного минимума
-    resistance: high7d * 0.98  // -2% от недельного максимума
-  };
+  const variance = returns.reduce((a, b) => a + b * b, 0) / returns.length;
+  return Math.sqrt(variance) * Math.sqrt(365) * 100;
 }
 
-// ---- Data providers ----------------------------------------------------------
+// ---------------- MARKET DATA ----------------
 async function fetchFromBinance(symbol) {
   const pair = binancePair[symbol];
-  if (!pair) throw new Error('PAIR_NOT_SUPPORTED');
+  if (!pair) throw new Error("PAIR_NOT_SUPPORTED");
 
-  // 24h ticker + last 7d hourly klines
   const [tickerRes, klinesRes] = await Promise.all([
-    axios.get('https://api.binance.com/api/v3/ticker/24hr', { params: { symbol: pair } }),
-    axios.get('https://api.binance.com/api/v3/klines', { params: { symbol: pair, interval: '1h', limit: 168 } })
+    axios.get("https://api.binance.com/api/v3/ticker/24hr", { params: { symbol: pair } }),
+    axios.get("https://api.binance.com/api/v3/klines", { params: { symbol: pair, interval: "1h", limit: 168 } })
   ]);
 
   const t = tickerRes.data;
   const kl = klinesRes.data;
+  const prices = kl.map(k => parseFloat(k[4]));
+  const volumes = kl.map(k => parseFloat(k[7]));
 
-  const prices = kl.map(k => parseFloat(k[4]));   // close
-  const volumes = kl.map(k => parseFloat(k[7]));  // quote asset volume (USDT)
-  const currentPrice = parseFloat(t.lastPrice);
-  const change24h = parseFloat(t.priceChangePercent);
-  const volume24h = parseFloat(t.quoteVolume);
-
-  return computeMetricsFromSeries(prices, volumes, currentPrice, change24h, volume24h);
+  return {
+    price: parseFloat(t.lastPrice),
+    change24h: parseFloat(t.priceChangePercent),
+    volume24h: parseFloat(t.quoteVolume),
+    high7d: Math.max(...prices),
+    low7d: Math.min(...prices),
+    avgVolume: volumes.reduce((a, b) => a + b, 0) / volumes.length,
+    volatility: calcVolatility(prices),
+    support: Math.min(...prices) * 1.02,
+    resistance: Math.max(...prices) * 0.98
+  };
 }
 
 async function fetchFromCoinGecko(symbol) {
   const coinId = symbolMapping[symbol];
-  if (!coinId) throw new Error('COIN_NOT_SUPPORTED');
-
-  const headers = {};
-  if (process.env.COINGECKO_API_KEY) {
-    headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
-  }
+  if (!coinId) throw new Error("COIN_NOT_SUPPORTED");
 
   const [priceRes, historyRes] = await Promise.all([
-    axios.get('https://api.coingecko.com/api/v3/simple/price', {
-      params: {
-        ids: coinId,
-        vs_currencies: 'usd',
-        include_24hr_change: 'true',
-        include_24hr_vol: 'true'
-      },
-      headers
-    }),
-    axios.get(`https://api.coingecko.com/api/v3/coins/${coinId}/market_chart`, {
-      params: { vs_currency: 'usd', days: 7 },
-      headers
-    })
+    axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`),
+    axios.get(`https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=7`)
   ]);
 
-  const priceData = priceRes.data[coinId] || {};
-  const historyData = historyRes.data || {};
+  const pd = priceRes.data[coinId];
+  const hd = historyRes.data;
+  const prices = hd.prices.map(p => p[1]);
+  const volumes = hd.total_volumes.map(v => v[1]);
 
-  const prices = (historyData.prices || []).map(p => p[1]);
-  const volumes = (historyData.total_volumes || []).map(v => v[1]);
-  const currentPrice = Number(priceData.usd);
-  const change24h = Number(priceData.usd_24h_change || 0);
-  const volume24h = Number(priceData.usd_24h_vol || 0);
-
-  return computeMetricsFromSeries(prices, volumes, currentPrice, change24h, volume24h);
+  return {
+    price: pd.usd,
+    change24h: pd.usd_24h_change,
+    volume24h: pd.usd_24h_vol,
+    high7d: Math.max(...prices),
+    low7d: Math.min(...prices),
+    avgVolume: volumes.reduce((a, b) => a + b, 0) / volumes.length,
+    volatility: calcVolatility(prices),
+    support: Math.min(...prices) * 1.02,
+    resistance: Math.max(...prices) * 0.98
+  };
 }
 
-/** Unified market data fetcher with fallback */
-async function getMarketData(inputSymbol) {
-  const s = String(inputSymbol || '').toUpperCase();
-  const pair = binancePair[s];
-  console.log(`Получаю данные для ${s}${pair ? ` (${pair})` : ''}...`);
-
-  // Try Binance first
+async function getMarketData(symbol) {
   try {
-    const res = await fetchFromBinance(s);
-    if (res) return { provider: 'Binance', symbol: s, ...res };
-  } catch (e) {
-    const code = e?.response?.status;
-    console.warn('Binance error:', code || e.message);
-  }
-
-  // Fallback to CoinGecko
-  try {
-    const res = await fetchFromCoinGecko(s);
-    if (res) return { provider: 'CoinGecko', symbol: s, ...res };
-  } catch (e) {
-    const code = e?.response?.status;
-    if (code === 451) {
-      console.error('CoinGecko: 451 Unavailable For Legal Reasons');
-    } else {
-      console.error('CoinGecko error:', code || e.message);
+    return await fetchFromBinance(symbol);
+  } catch {
+    try {
+      return await fetchFromCoinGecko(symbol);
+    } catch {
+      return null;
     }
   }
-
-  return null;
 }
 
-// ---- Messages formatting -----------------------------------------------------
-function formatMarketMessage(md) {
-  const arrow = md.change24h >= 0 ? '🟢' : '🔴';
-  const provider = md.provider === 'Binance' ? 'Binance' : 'CoinGecko';
+// ---------------- POSITION LOGIC ----------------
+function calculateOptimalLevels(entryPrice, direction, marketData, riskPercent = 4) {
+  const { support, resistance, volatility } = marketData;
+  let stopLoss, takeProfit;
 
-  return [
-    `📊 *${md.symbol}* — данные: _${provider}_`,
-    `Цена: *$${round(md.price, 2).toLocaleString('en-US')}* ${arrow}`,
-    `Изм. 24ч: *${round(md.change24h, 2)}%*`,
-    `Объём 24ч: *$${round(md.volume24h, 0).toLocaleString('en-US')}*`,
-    `Недельный диапазон: *$${round(md.low7d,2)}* — *$${round(md.high7d,2)}*`,
-    `Волатильность(год): *${round(md.volatility,2)}%*`,
-    `📉 Поддержка: *$${round(md.support,2)}*`,
-    `📈 Сопротивление: *$${round(md.resistance,2)}*`
-  ].join('\n');
+  if (direction === "long") {
+    const buffer = entryPrice * (volatility / 100) * 0.5;
+    stopLoss = Math.min(support - buffer, entryPrice * (1 - riskPercent / 100));
+    const risk = entryPrice - stopLoss;
+    takeProfit = Math.max(resistance, entryPrice + risk * 2);
+  } else {
+    const buffer = entryPrice * (volatility / 100) * 0.5;
+    stopLoss = Math.max(resistance + buffer, entryPrice * (1 + riskPercent / 100));
+    const risk = stopLoss - entryPrice;
+    takeProfit = Math.min(support, entryPrice - risk * 2);
+  }
+  return { stopLoss: round(stopLoss, 2), takeProfit: round(takeProfit, 2) };
 }
 
-function formatSignal(md) {
-  const nearSupport = md.price <= md.support * 1.02;
-  const nearResistance = md.price >= md.resistance * 0.98;
-
-  let idea = 'Нейтрально. Ждём сигнала у уровней.';
-  if (nearSupport) idea = 'Вблизи *поддержки*. Возможен аккуратный лонг со стопом ниже поддержки.';
-  if (nearResistance) idea = 'Вблизи *сопротивления*. Возможен шорт/фиксация прибыли.';
-
-  const sl = md.price * (md.change24h < 0 ? 0.96 : 0.94); // грубый стоп 4–6%
-  const tp = md.price * (md.change24h < 0 ? 1.06 : 1.08); // грубый тейк 6–8%
-
-  return [
-    formatMarketMessage(md),
-    '',
-    `🎯 Идея: ${idea}`,
-    `🛑 Стоп: *$${round(sl, 2)}*`,
-    `✅ Тейк: *$${round(tp, 2)}*`
-  ].join('\n');
+function calculatePnL(pos, price) {
+  let pnl = 0;
+  if (pos.direction === "long") pnl = (price - pos.entryPrice) * pos.quantity;
+  else pnl = (pos.entryPrice - price) * pos.quantity;
+  return pnl;
 }
 
-// ---- Telegram bot ------------------------------------------------------------
-let bot = null;
-if (!BOT_TOKEN || BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
-  console.warn('⚠️ BOT_TOKEN не задан. Задайте переменную окружения BOT_TOKEN в Render.');
+// ---------------- BOT ----------------
+if (!BOT_TOKEN || BOT_TOKEN === "YOUR_BOT_TOKEN_HERE") {
+  console.warn("⚠️ BOT_TOKEN not set!");
 } else {
-  bot = new TelegramBot(BOT_TOKEN, { polling: true });
+  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-  bot.onText(/^\/start$/, (msg) => {
-    const chatId = msg.chat.id;
-    users.set(chatId, { id: chatId, username: msg.from?.username });
-    bot.sendMessage(
-      chatId,
-      [
-        '🤖 Привет! Я *AI Crypto Tracker*.',
-        'Команды:',
-        '• `/price BTC` — быстрая сводка',
-        '• `/signal BTC` — уровни + черновой план',
-        '',
-        'Поддерживаемые тикеры: BTC, ETH, SOL, ADA, DOT, MATIC, LINK, UNI, AVAX, ATOM, XRP, DOGE, LTC, BCH.',
-      ].join('\n'),
-      { parse_mode: 'Markdown' }
+  // --- START ---
+  bot.onText(/\/start/, (msg) => {
+    const welcomeMessage = `
+🤖 <b>AI Crypto Tracker Bot</b> (обновленная версия)
+
+🚀 <b>Привет!</b> Я AI Crypto Tracker.  
+Я помогаю отслеживать ваши криптопозиции и даю персональные торговые сигналы на основе реальных рыночных данных.  
+
+<b>Что я умею:</b>  
+📊 Анализирую рынок и рекомендую стоп-лоссы/тейк-профиты  
+💡 Даю сигналы когда пора добирать или закрывать  
+📈 Считаю P&L по всему портфелю  
+⚡ Присылаю важные уведомления  
+
+<b>Поддерживаю:</b> BTC, ETH, SOL, ADA, DOT, MATIC, LINK, UNI, AVAX, ATOM  
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 <b>Добавим вашу первую позицию?</b>  
+
+Просто напишите:  
+<code>BTC long 45000</code>  
+<code>ETH short 3200, депозит 1000</code>  
+<code>SOL long 180, размер 5</code>  
+
+🤖 Я сам проанализирую рынок и предложу оптимальные уровни! 🚀
+    `;
+    bot.sendMessage(msg.chat.id, welcomeMessage, { parse_mode: "HTML" });
+  });
+
+  // --- ADD POSITION ---
+  bot.on("message", async (msg) => {
+    if (!msg.text || msg.text.startsWith("/")) return;
+    const text = msg.text.toUpperCase();
+    const symbol = Object.keys(binancePair).find(s => text.includes(s));
+    const direction = text.includes("LONG") ? "long" : text.includes("SHORT") ? "short" : null;
+    const priceMatch = text.match(/(\d+(\.\d+)?)/);
+    const depositMatch = text.match(/DEPOSIT\s*(\d+)/i) || text.match(/ДЕПОЗИТ\s*(\d+)/i);
+
+    if (!symbol || !direction || !priceMatch) {
+      bot.sendMessage(msg.chat.id, "❌ Неверный формат. Пример: BTC long 45000 deposit 1000");
+      return;
+    }
+
+    const entry = parseFloat(priceMatch[1]);
+    const deposit = depositMatch ? parseFloat(depositMatch[1]) : null;
+
+    const marketData = await getMarketData(symbol);
+    if (!marketData) {
+      bot.sendMessage(msg.chat.id, "❌ Ошибка загрузки данных");
+      return;
+    }
+
+    const levels = calculateOptimalLevels(entry, direction, marketData);
+    const qty = deposit ? round(deposit / entry, 4) : 1;
+
+    const posId = `${msg.from.id}_${Date.now()}`;
+    const position = {
+      id: posId, userId: msg.from.id, symbol,
+      direction, entryPrice: entry, stopLoss: levels.stopLoss, takeProfit: levels.takeProfit,
+      quantity: qty, isActive: true
+    };
+    positions.set(posId, position);
+
+    bot.sendMessage(msg.chat.id,
+      `✅ Позиция добавлена: ${symbol} ${direction.toUpperCase()}\nВход: $${entry}\nSL: $${levels.stopLoss}\nTP: $${levels.takeProfit}\nРазмер: ${qty}`
     );
   });
 
-  bot.onText(/^\/price\s+([A-Za-z]{2,10})$/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const symbol = (match[1] || '').toUpperCase();
-    const md = await getMarketData(symbol);
-    if (!md) {
-      return bot.sendMessage(chatId, `❌ Не удалось получить данные по ${symbol}. Попробуйте позже или другой тикер.`);
+  // --- POSITIONS ---
+  bot.onText(/\/positions/, async (msg) => {
+    const userPos = Array.from(positions.values()).filter(p => p.userId === msg.from.id && p.isActive);
+    if (!userPos.length) return bot.sendMessage(msg.chat.id, "📭 У вас нет активных позиций.");
+    let text = "📊 <b>Ваши позиции:</b>\n\n";
+    for (const [i, p] of userPos.entries()) {
+      const md = await getMarketData(p.symbol);
+      const pnl = md ? calculatePnL(p, md.price) : 0;
+      const pnlPct = md ? (pnl / (p.entryPrice * p.quantity)) * 100 : 0;
+      text += `${i+1}. ${p.symbol} ${p.direction.toUpperCase()} | Вход $${p.entryPrice} | Текущая $${md?.price || "N/A"}\nP&L: ${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%) | SL $${p.stopLoss} | TP $${p.takeProfit}\n\n`;
     }
-    bot.sendMessage(chatId, formatMarketMessage(md), { parse_mode: 'Markdown' });
+    bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
   });
 
-  bot.onText(/^\/signal\s+([A-Za-z]{2,10})$/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const symbol = (match[1] || '').toUpperCase();
-    const md = await getMarketData(symbol);
-    if (!md) {
-      return bot.sendMessage(chatId, `❌ Не удалось получить данные по ${symbol}.`);
+  // --- BALANCE ---
+  bot.onText(/\/balance/, async (msg) => {
+    const userPos = Array.from(positions.values()).filter(p => p.userId === msg.from.id && p.isActive);
+    if (!userPos.length) return bot.sendMessage(msg.chat.id, "📭 У вас нет активных позиций.");
+    let total = 0, invested = 0;
+    for (const p of userPos) {
+      const md = await getMarketData(p.symbol);
+      if (!md) continue;
+      invested += p.entryPrice * p.quantity;
+      total += calculatePnL(p, md.price);
     }
-    bot.sendMessage(chatId, formatSignal(md), { parse_mode: 'Markdown' });
+    const pct = invested > 0 ? (total / invested) * 100 : 0;
+    bot.sendMessage(msg.chat.id, `💰 Общий P&L: ${total.toFixed(2)} USD (${pct.toFixed(2)}%)`);
   });
 
-  // Fallback: user sends just "BTC"
-  bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const text = (msg.text || '').trim();
+  // --- HELP ---
+  bot.onText(/\/help/, (msg) => {
+    bot.sendMessage(msg.chat.id, `
+📋 <b>Помощь</b>
 
-    if (/^[A-Za-z]{2,10}$/.test(text)) {
-      const symbol = text.toUpperCase();
-      const md = await getMarketData(symbol);
-      if (!md) return;
-      bot.sendMessage(chatId, formatMarketMessage(md), { parse_mode: 'Markdown' });
-    }
+/positions - список позиций  
+/balance - общий P&L  
+/close N - закрыть позицию  
+/subscribe - премиум  
+
+Просто напиши позицию:  
+<code>BTC long 45000</code>  
+<code>ETH short 3200 deposit 1000</code>  
+    `, { parse_mode: "HTML" });
   });
 }
 
-// ---- HTTP server -------------------------------------------------------------
-app.get('/', (_req, res) => {
-  res.status(200).send('AI Crypto Tracker Bot is running.');
-});
-
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'OK',
-    uptime: process.uptime(),
-    users: users.size,
-    region_hint: process.env.RENDER_REGION || 'unknown'
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 AI Crypto Tracker Bot запущен!`);
-  console.log(`🌐 Server running on port ${PORT}`);
-  console.log(`💡 Для получения токена напишите @BotFather в Telegram`);
-  console.log(`🔧 Не забудьте заменить YOUR_BOT_TOKEN_HERE на ваш токен!`);
-});
-
-console.log('🤖 AI Crypto Tracker Bot v2.1 готов к работе!');
+// ---------------- EXPRESS ----------------
+const appServer = express();
+appServer.get("/", (req, res) => res.send("🤖 AI Crypto Tracker Bot is running"));
+appServer.get("/health", (req, res) => res.json({ status: "OK", uptime: process.uptime(), users: users.size, positions: positions.size }));
+appServer.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
