@@ -13,60 +13,76 @@ const awaitingInput = new Map(); // Для отслеживания ожидаю
 // Админский пароль
 const ADMIN_PASSWORD = 'crypto123';
 
-// Маппинг символов для API
+// Маппинг символов для Binance API
 const symbolMapping = {
-    'BTC': 'bitcoin',
-    'ETH': 'ethereum', 
-    'SOL': 'solana',
-    'ADA': 'cardano',
-    'DOT': 'polkadot',
-    'MATIC': 'matic-network',
-    'LINK': 'chainlink',
-    'UNI': 'uniswap',
-    'AVAX': 'avalanche-2',
-    'ATOM': 'cosmos',
-    'XRP': 'ripple',
-    'DOGE': 'dogecoin',
-    'LTC': 'litecoin',
-    'BCH': 'bitcoin-cash'
+    'BTC': 'BTCUSDT',
+    'ETH': 'ETHUSDT', 
+    'SOL': 'SOLUSDT',
+    'ADA': 'ADAUSDT',
+    'DOT': 'DOTUSDT',
+    'MATIC': 'MATICUSDT',
+    'LINK': 'LINKUSDT',
+    'UNI': 'UNIUSDT',
+    'AVAX': 'AVAXUSDT',
+    'ATOM': 'ATOMUSDT',
+    'XRP': 'XRPUSDT',
+    'DOGE': 'DOGEUSDT',
+    'LTC': 'LTCUSDT',
+    'BCH': 'BCHUSDT'
 };
 
-// Получение цены и рыночных данных
+// Получение цены и рыночных данных через Binance API
 async function getMarketData(symbol) {
     try {
-        const coinId = symbolMapping[symbol.toUpperCase()];
-        if (!coinId) return null;
+        const binanceSymbol = symbolMapping[symbol.toUpperCase()];
+        if (!binanceSymbol) {
+            console.log(`Символ ${symbol} не поддерживается`);
+            return null;
+        }
 
-        // Получаем текущую цену и данные за 24ч
-        const [priceResponse, historyResponse] = await Promise.all([
-            axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`),
-            axios.get(`https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=7`)
-        ]);
+        console.log(`Получаю данные для ${symbol} (${binanceSymbol})...`);
 
-        const priceData = priceResponse.data[coinId];
-        const historyData = historyResponse.data;
+        // Получаем текущую цену и статистику 24ч
+        const ticker24h = await axios.get(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceSymbol}`, {
+            timeout: 10000
+        });
 
-        if (!priceData || !historyData) return null;
+        // Получаем исторические данные за 7 дней (свечи по 1 дню)
+        const klines = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=1d&limit=7`, {
+            timeout: 10000
+        });
 
-        // Расчет поддержек и сопротивлений
-        const prices = historyData.prices.map(p => p[1]);
-        const volumes = historyData.total_volumes.map(v => v[1]);
-        
-        const currentPrice = priceData.usd;
-        const change24h = priceData.usd_24h_change || 0;
-        const volume24h = priceData.usd_24h_vol || 0;
+        if (!ticker24h.data || !klines.data) {
+            console.log(`Нет данных для ${symbol}`);
+            return null;
+        }
 
-        // Простой расчет поддержки/сопротивления
+        const ticker = ticker24h.data;
+        const candles = klines.data;
+
+        // Извлекаем данные
+        const currentPrice = parseFloat(ticker.lastPrice);
+        const change24h = parseFloat(ticker.priceChangePercent);
+        const volume24h = parseFloat(ticker.volume) * currentPrice;
+
+        // Расчет high/low за 7 дней
+        const prices = candles.map(c => [parseFloat(c[2]), parseFloat(c[3])]).flat(); // high и low каждой свечи
         const high7d = Math.max(...prices);
         const low7d = Math.min(...prices);
+
+        // Средний объем за 7 дней
+        const volumes = candles.map(c => parseFloat(c[5]) * parseFloat(c[4])); // volume * close price
         const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
 
-        // Расчет волатильности
+        // Расчет волатильности (стандартное отклонение цен закрытия)
+        const closePrices = candles.map(c => parseFloat(c[4]));
         const returns = [];
-        for (let i = 1; i < prices.length; i++) {
-            returns.push((prices[i] - prices[i-1]) / prices[i-1]);
+        for (let i = 1; i < closePrices.length; i++) {
+            returns.push((closePrices[i] - closePrices[i-1]) / closePrices[i-1]);
         }
         const volatility = Math.sqrt(returns.reduce((a, b) => a + b*b, 0) / returns.length) * Math.sqrt(365) * 100;
+
+        console.log(`✅ Данные получены для ${symbol}: ${currentPrice}`);
 
         return {
             price: currentPrice,
@@ -80,7 +96,7 @@ async function getMarketData(symbol) {
             resistance: high7d * 0.98 // 2% ниже максимума недели
         };
     } catch (error) {
-        console.error('Ошибка получения рыночных данных:', error);
+        console.error(`❌ Ошибка получения данных для ${symbol}:`, error.message);
         return null;
     }
 }
