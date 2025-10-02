@@ -1,95 +1,97 @@
 /**
- * 🤖 AI Crypto Tracker Bot v4 (webhook + /tick)
- * - Webhook вместо polling (нет 409)
- * - /tick для Render Cron Job (будит сервис на Free)
+ * 🤖 AI Crypto Tracker Bot v4.3 (webhook + /tick + Render-friendly)
+ * - Webhook (без polling) → нет 409
+ * - /tick с проверкой CRON_KEY → для Render Cron Job
  * - Binance primary, CoinGecko fallback (COINGECKO_API_KEY)
  * - Команды: /start /help /subscribe /positions /signals /balance /close /admin
- * - Добавлен ONDO
+ * - Добавлен ONDO; примеры: BTC long 114000, ETH short 3200, deposit 1000
+ * - На Free укажите DISABLE_INTERVALS=true (используем только Cron Job)
  */
 
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
 
-// ------------ ENV ------------
+// ---------- ENV ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const BASE_URL  = process.env.BASE_URL || ''; // напр. https://ai-crypto-tracker.onrender.com
+const BASE_URL  = process.env.BASE_URL || '';                 // напр. https://ai-crypto-tracker.onrender.com
 const PORT      = Number(process.env.PORT) || 10000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASS || 'crypto123';
-const CRON_KEY  = process.env.CRON_KEY || ''; // опционально для защиты /tick
-const DISABLE_INTERVALS = !!process.env.DISABLE_INTERVALS; // можно отключить setInterval на Free
+const CRON_KEY  = process.env.CRON_KEY || '';                 // напр. my-secret
+const DISABLE_INTERVALS = !!process.env.DISABLE_INTERVALS;    // true на Free
 
-// axios настройки
-axios.defaults.timeout = 10000;
-axios.defaults.headers.common['User-Agent'] = 'AI-Crypto-Tracker/4.0 (+render.com)';
+axios.defaults.timeout = 12000;
+axios.defaults.headers.common['User-Agent'] = 'AI-Crypto-Tracker/4.3 (+render.com)';
 
-// ------------ STATE ------------
+// ---------- STATE (in-memory) ----------
 const users = new Map();
-const positions = new Map();     // positionId -> position
-const awaitingInput = new Map(); // draft per user
+const positions = new Map();
+const awaitingInput = new Map();
 
-// ------------ SYMBOL MAPS ------------
+// ---------- SYMBOL MAPS ----------
 const binancePair = {
   BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT', ADA: 'ADAUSDT',
   DOT: 'DOTUSDT', MATIC: 'MATICUSDT', LINK: 'LINKUSDT', UNI: 'UNIUSDT',
   AVAX: 'AVAXUSDT', ATOM: 'ATOMUSDT', XRP: 'XRPUSDT', DOGE: 'DOGEUSDT',
   LTC: 'LTCUSDT', BCH: 'BCHUSDT',
-  ONDO: 'ONDOUSDT' // добавлено
+  ONDO: 'ONDOUSDT'
 };
-
 const symbolMapping = {
   BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', ADA: 'cardano',
   DOT: 'polkadot', MATIC: 'matic-network', LINK: 'chainlink', UNI: 'uniswap',
   AVAX: 'avalanche-2', ATOM: 'cosmos', XRP: 'ripple', DOGE: 'dogecoin',
   LTC: 'litecoin', BCH: 'bitcoin-cash',
-  ONDO: 'ondo-finance' // добавлено
+  ONDO: 'ondo-finance'
 };
 
-// ------------ HELPERS ------------
-function round(v, d = 2) { return Math.round(Number(v) * 10**d) / 10**d; }
+// ---------- HELPERS ----------
+const round = (v, d = 2) => Math.round(Number(v) * 10 ** d) / 10 ** d;
 
 function calcVolatility(prices) {
-  const returns = [];
+  const rets = [];
   for (let i = 1; i < prices.length; i++) {
-    const prev = prices[i-1]; const cur = prices[i];
+    const prev = prices[i - 1], cur = prices[i];
     if (prev > 0) {
       const r = (cur - prev) / prev;
-      if (Number.isFinite(r)) returns.push(r);
+      if (Number.isFinite(r)) rets.push(r);
     }
   }
-  const variance = returns.length ? returns.reduce((a,b)=>a+b*b,0)/returns.length : 0;
+  const variance = rets.length ? rets.reduce((a, b) => a + b * b, 0) / rets.length : 0;
   return Math.sqrt(variance) * Math.sqrt(365) * 100;
 }
 
-// ------------ MARKET DATA ------------
-async function binanceFetch(url, params) {
+// ---------- MARKET DATA ----------
+async function binanceGet(url, params) {
   try { return (await axios.get(url, { params })).data; }
-  catch (e) { console.warn('Binance:', url, e.response?.status || e.code || e.message); throw e; }
+  catch (e) { console.warn('Binance', url, e.response?.status || e.code || e.message); throw e; }
 }
 
 async function fetchFromBinance(symbol) {
   const pair = binancePair[symbol]; if (!pair) throw new Error('PAIR_NOT_SUPPORTED');
   const hosts = ['https://api.binance.com', 'https://data-api.binance.vision'];
-  let ticker=null, kl=null;
+  let t = null, kl = null;
   for (const h of hosts) {
     try {
-      [ticker, kl] = await Promise.all([
-        binanceFetch(`${h}/api/v3/ticker/24hr`, { symbol: pair }),
-        binanceFetch(`${h}/api/v3/klines`, { symbol: pair, interval: '1h', limit: 168 })
+      [t, kl] = await Promise.all([
+        binanceGet(`${h}/api/v3/ticker/24hr`, { symbol: pair }),
+        binanceGet(`${h}/api/v3/klines`, { symbol: pair, interval: '1h', limit: 168 })
       ]);
       break;
-    } catch { ticker=kl=null; }
+    } catch { t = kl = null; }
   }
-  if (!ticker || !kl) throw new Error('BINANCE_UNAVAILABLE');
-  const prices = kl.map(k=>parseFloat(k[4])); // close
-  const volumes = kl.map(k=>parseFloat(k[7])); // quote vol
+  if (!t || !kl) throw new Error('BINANCE_UNAVAILABLE');
+
+  const prices = kl.map(k => parseFloat(k[4])); // close
+  const volumes = kl.map(k => parseFloat(k[7])); // quote volume
+
   return {
     provider: 'Binance',
-    price: parseFloat(ticker.lastPrice),
-    change24h: parseFloat(ticker.priceChangePercent),
-    volume24h: parseFloat(ticker.quoteVolume),
-    high7d: Math.max(...prices), low7d: Math.min(...prices),
-    avgVolume: volumes.length ? volumes.reduce((a,b)=>a+b,0)/volumes.length : 0,
+    price: parseFloat(t.lastPrice),
+    change24h: parseFloat(t.priceChangePercent),
+    volume24h: parseFloat(t.quoteVolume),
+    high7d: Math.max(...prices),
+    low7d: Math.min(...prices),
+    avgVolume: volumes.length ? volumes.reduce((a, b) => a + b, 0) / volumes.length : 0,
     volatility: calcVolatility(prices),
     support: Math.min(...prices) * 1.02,
     resistance: Math.max(...prices) * 0.98
@@ -98,19 +100,21 @@ async function fetchFromBinance(symbol) {
 
 async function fetchFromCoinGecko(symbol) {
   const id = symbolMapping[symbol]; if (!id) throw new Error('COIN_NOT_SUPPORTED');
-  const headers = {}; if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
+  const headers = {};
+  if (process.env.COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
+
   const [pr, hr] = await Promise.all([
     axios.get('https://api.coingecko.com/api/v3/simple/price', {
-      params: { ids: id, vs_currencies: 'usd', include_24hr_change: 'true', include_24hr_vol: 'true' },
-      headers
+      params: { ids: id, vs_currencies: 'usd', include_24hr_change: 'true', include_24hr_vol: 'true' }, headers
     }),
     axios.get(`https://api.coingecko.com/api/v3/coins/${id}/market_chart`, {
       params: { vs_currency: 'usd', days: 7 }, headers
     })
   ]);
   const pd = pr.data[id]; const hd = hr.data;
-  const prices = (hd.prices || []).map(p=>p[1]);
-  const volumes = (hd.total_volumes || []).map(v=>v[1]);
+  const prices = (hd.prices || []).map(p => p[1]);
+  const volumes = (hd.total_volumes || []).map(v => v[1]);
+
   return {
     provider: 'CoinGecko',
     price: Number(pd.usd),
@@ -118,7 +122,7 @@ async function fetchFromCoinGecko(symbol) {
     volume24h: Number(pd.usd_24h_vol || 0),
     high7d: prices.length ? Math.max(...prices) : 0,
     low7d: prices.length ? Math.min(...prices) : 0,
-    avgVolume: volumes.length ? volumes.reduce((a,b)=>a+b,0)/volumes.length : 0,
+    avgVolume: volumes.length ? volumes.reduce((a, b) => a + b, 0) / volumes.length : 0,
     volatility: calcVolatility(prices),
     support: prices.length ? Math.min(...prices) * 1.02 : 0,
     resistance: prices.length ? Math.max(...prices) * 0.98 : 0
@@ -126,7 +130,7 @@ async function fetchFromCoinGecko(symbol) {
 }
 
 async function getMarketData(sym) {
-  const S = String(sym||'').toUpperCase();
+  const S = String(sym || '').toUpperCase();
   if (!binancePair[S] && !symbolMapping[S]) return null;
   try { return await fetchFromBinance(S); }
   catch { console.warn('Binance failed → fallback CoinGecko'); }
@@ -134,37 +138,35 @@ async function getMarketData(sym) {
   catch (e) { console.error('CoinGecko failed:', e.response?.status || e.code || e.message); return null; }
 }
 
-// ------------ ANALYTICS ------------
-function calculateOptimalLevels(entry, dir, md, riskPercent=4) {
+// ---------- ANALYTICS ----------
+function calculateOptimalLevels(entry, dir, md, riskPercent = 4) {
   const { support, resistance, volatility } = md;
   let sl, tp;
   if (dir === 'long') {
-    const buf = entry * (volatility/100) * 0.5;
-    sl = Math.min(support - buf, entry * (1 - riskPercent/100));
+    const buf = entry * (volatility / 100) * 0.5;
+    sl = Math.min(support - buf, entry * (1 - riskPercent / 100));
     const risk = entry - sl;
-    tp = Math.max(resistance, entry + risk*2);
+    tp = Math.max(resistance, entry + risk * 2);
   } else {
-    const buf = entry * (volatility/100) * 0.5;
-    sl = Math.max(resistance + buf, entry * (1 + riskPercent/100));
+    const buf = entry * (volatility / 100) * 0.5;
+    sl = Math.max(resistance + buf, entry * (1 + riskPercent / 100));
     const risk = sl - entry;
-    tp = Math.min(support, entry - risk*2);
+    tp = Math.min(support, entry - risk * 2);
   }
-  return { stopLoss: round(sl,2), takeProfit: round(tp,2), riskPercent: Math.abs((sl-entry)/entry*100) };
+  return { stopLoss: round(sl, 2), takeProfit: round(tp, 2), riskPercent: Math.abs((sl - entry) / entry * 100) };
 }
 
-function calculatePositionSize(deposit, entry, sl, riskPercent=4) {
-  const riskAmount = deposit * (riskPercent/100);
+function calculatePositionSize(deposit, entry, sl, riskPercent = 4) {
+  const riskAmount = deposit * (riskPercent / 100);
   const priceRisk = Math.abs(entry - sl);
-  const positionValue = priceRisk > 0 ? riskAmount / (priceRisk/entry) : 0;
+  const positionValue = priceRisk > 0 ? riskAmount / (priceRisk / entry) : 0;
   const qty = entry > 0 ? positionValue / entry : 0;
-  return { quantity: round(qty,5), positionValue: round(positionValue,2), riskAmount: round(riskAmount,2) };
+  return { quantity: round(qty, 5), positionValue: round(positionValue, 2), riskAmount: round(riskAmount, 2) };
 }
 
-function calculatePnL(pos, price) {
-  return pos.direction === 'long'
-    ? (price - pos.entryPrice) * pos.quantity
-    : (pos.entryPrice - price) * pos.quantity;
-}
+const calculatePnL = (p, price) => p.direction === 'long'
+  ? (price - p.entryPrice) * p.quantity
+  : (p.entryPrice - price) * p.quantity;
 
 function generateMarketSignals(position, md) {
   const signals = [];
@@ -172,33 +174,32 @@ function generateMarketSignals(position, md) {
   const stopDistance = Math.abs(price - position.stopLoss) / Math.max(1e-9, position.stopLoss) * 100;
   const takeDist = Math.abs(price - position.takeProfit) / Math.max(1e-9, position.takeProfit) * 100;
 
-  if (stopDistance < 2) signals.push({ type:'warning', message:'🔴 ВНИМАНИЕ! Приближение к стоп-лоссу' });
-  if (takeDist < 3) signals.push({ type:'profit', message:'🎯 Близко к тейк-профиту! Возможна частичная фиксация' });
-  if (md.avgVolume>0 && md.volume24h > md.avgVolume * 1.5) signals.push({ type:'volume', message:'📈 Повышенные объёмы — возможно сильное движение' });
-  if (Math.abs(md.change24h) > 8) signals.push({ type:'volatility', message:`⚡ Волатильность: ${md.change24h>0?'рост':'падение'} ${round(Math.abs(md.change24h),1)}%` });
+  if (stopDistance < 2) signals.push({ type: 'warning', message: '🔴 ВНИМАНИЕ! Приближение к стоп-лоссу' });
+  if (takeDist < 3) signals.push({ type: 'profit', message: '🎯 Близко к тейк-профиту! Возможна частичная фиксация' });
+  if (md.avgVolume > 0 && md.volume24h > md.avgVolume * 1.5) signals.push({ type: 'volume', message: '📈 Повышенные объёмы — возможно сильное движение' });
+  if (Math.abs(md.change24h) > 8) signals.push({ type: 'volatility', message: `⚡ Волатильность: ${md.change24h > 0 ? 'рост' : 'падение'} ${round(Math.abs(md.change24h), 1)}%` });
   return signals;
 }
 
-// ------------ PARSER ------------
+// ---------- PARSER ----------
 function parsePositionInput(raw) {
-  const normalized = String(raw||'')
-    .replace(/[,]/g,' ')
-    .replace(/\$/g,'')
-    .replace(/\s+/g,' ')
+  const normalized = String(raw || '')
+    .replace(/[,]/g, ' ')
+    .replace(/\$/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
 
   const upper = normalized.toUpperCase();
-
   const symbol = Object.keys(binancePair).find(s => new RegExp(`\\b${s}\\b`).test(upper)) || null;
   const direction = /\b(LONG|ЛОНГ)\b/i.test(normalized) ? 'long'
-                   : (/\b(SHORT|ШОРТ)\b/i.test(normalized) ? 'short' : null);
+    : (/\b(SHORT|ШОРТ)\b/i.test(normalized) ? 'short' : null);
 
   const depositMatch = normalized.match(/(?:DEPOSIT|ДЕПОЗИТ|DEP|ДЕП)\s*([\d.]+)/i);
   const sizeMatch    = normalized.match(/(?:SIZE|РАЗМЕР|КОЛИЧЕСТВО)\s*([\d.]+)/i);
   const deposit = depositMatch ? parseFloat(depositMatch[1]) : null;
   const size    = sizeMatch ? parseFloat(sizeMatch[1]) : null;
 
-  // числа, исключая депозит/размер
+  // числа, исключая депозит/размер — первое оставшееся считаем ценой входа
   const nums = (normalized.match(/(\d+(?:\.\d+)?)/g) || []).map(Number);
   const candidates = nums.filter(n => n !== deposit && n !== size);
   const entryPrice = candidates.length ? parseFloat(candidates[0]) : null;
@@ -206,40 +207,42 @@ function parsePositionInput(raw) {
   return { symbol, direction, entryPrice, deposit, size };
 }
 
-// ------------ TELEGRAM BOT (WEBHOOK) ------------
+// ---------- TELEGRAM (WEBHOOK MODE) ----------
 let bot = null;
 if (!BOT_TOKEN || BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
-  console.warn('⚠️ BOT_TOKEN не задан. Установите переменную окружения BOT_TOKEN.');
+  console.warn('⚠️ BOT_TOKEN не задан. Установите его в Environment.');
 } else {
   bot = new TelegramBot(BOT_TOKEN); // без polling
 }
 
-// ------------ EXPRESS APP ------------
+// ---------- EXPRESS ----------
 const app = express();
 app.use(express.json());
 
-// Webhook endpoint
+// Webhook эндпоинт
 if (bot) {
   if (BASE_URL) {
-    bot.setWebHook(`${BASE_URL}/bot${BOT_TOKEN}`).then(() => {
-      console.log('✅ Webhook set:', `${BASE_URL}/bot${BOT_TOKEN}`);
-    }).catch(e => console.error('setWebHook error:', e.message));
+    bot.setWebHook(`${BASE_URL}/bot${BOT_TOKEN}`)
+      .then(() => console.log('✅ Webhook set:', `${BASE_URL}/bot${BOT_TOKEN}`))
+      .catch(e => console.error('setWebHook error:', e.message));
   } else {
     console.warn('⚠️ BASE_URL не задан — webhook не будет установлен.');
   }
-
   app.post(`/bot${BOT_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
   });
 }
 
-// Health
+// Health (проверка живости)
 app.get('/', (_req,res)=>res.send('🤖 AI Crypto Tracker: Webhook mode OK'));
-app.get('/health', (_req,res)=>res.json({ status:'OK', uptime:process.uptime(), users:users.size,
-  positions:Array.from(positions.values()).filter(p=>p.isActive).length }));
+app.get('/health', (_req,res)=>res.json({
+  status:'OK', uptime:process.uptime(),
+  users: users.size,
+  positions: Array.from(positions.values()).filter(p=>p.isActive).length
+}));
 
-// ----------- /tick for Cron Job -----------
+// ----- /tick для Cron Job (с проверкой CRON_KEY) -----
 async function checkPositionsAndNotify() {
   console.log('⏱ Tick: checking positions...');
   for (const position of positions.values()) {
@@ -247,6 +250,7 @@ async function checkPositionsAndNotify() {
     try {
       const md = await getMarketData(position.symbol);
       if (!md) continue;
+
       const sigs = generateMarketSignals(position, md)
         .filter(s => s.type === 'warning' || s.type === 'profit');
       if (!sigs.length) continue;
@@ -262,7 +266,7 @@ async function checkPositionsAndNotify() {
 ${sigs.map(s => `• ${s.message}`).join('\n')}
       `;
       await bot.sendMessage(position.userId, text, { parse_mode: 'HTML' });
-      await new Promise(r => setTimeout(r, 300));
+      await new Promise(r => setTimeout(r, 300)); // лёгкий троттлинг
     } catch (e) {
       console.error('tick loop error:', e.response?.status || e.message);
     }
@@ -271,8 +275,9 @@ ${sigs.map(s => `• ${s.message}`).join('\n')}
 
 app.get('/tick', async (req, res) => {
   try {
-    if (CRON_KEY && req.headers['x-cron-key'] !== CRON_KEY) {
-      return res.status(401).json({ ok:false, error:'unauthorized' });
+    if (CRON_KEY) {
+      const key = req.headers['x-cron-key'];
+      if (key !== CRON_KEY) return res.status(403).json({ ok:false, error:'Forbidden' });
     }
     await checkPositionsAndNotify();
     res.json({ ok:true, checked: Array.from(positions.values()).filter(p=>p.isActive).length });
@@ -282,7 +287,7 @@ app.get('/tick', async (req, res) => {
   }
 });
 
-// ------------ COMMANDS & FLOWS ------------
+// ---------- COMMANDS ----------
 if (bot) {
   bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id; const userId = msg.from.id;
@@ -307,15 +312,12 @@ if (bot) {
     bot.sendMessage(chatId, welcome, { parse_mode:'HTML' });
   });
 
-  // свободный ввод — добавление позиции
+  // Свободный ввод — добавление позиции
   bot.on('message', async (msg) => {
     if (!msg.text || msg.text.startsWith('/')) return;
     const chatId = msg.chat.id; const userId = msg.from.id;
 
-    if (!users.has(userId)) {
-      bot.sendMessage(chatId, 'Пожалуйста, начните с /start');
-      return;
-    }
+    if (!users.has(userId)) { bot.sendMessage(chatId, 'Пожалуйста, начните с /start'); return; }
     const user = users.get(userId);
     if (!user.isPremium && user.positionCount >= 3) {
       bot.sendMessage(chatId, `
@@ -373,11 +375,10 @@ ${parsed.deposit ? `💵 <b>Депозит:</b> $${parsed.deposit}` : parsed.siz
 🎯 <b>Рекомендации:</b>
 🛑 SL: $${levels.stopLoss} (риск ~${round(levels.riskPercent,1)}%)
 🎯 TP: $${levels.takeProfit} (R:R ≈ 1:2)
+
+<b>✅ Добавить позицию?</b>
     `;
-    if (posSize) {
-      text += `\n<b>📦 Рекомендуемый размер:</b> ${posSize.quantity} ${parsed.symbol} (~$${posSize.positionValue})`;
-    }
-    text += `\n\n<b>✅ Добавить позицию?</b>`;
+    if (posSize) text += `\n<b>📦 Рекомендуемый размер:</b> ${posSize.quantity} ${parsed.symbol} (~$${posSize.positionValue})`;
 
     await bot.editMessageText(text, {
       chat_id: chatId, message_id: wait.message_id, parse_mode:'HTML',
@@ -611,16 +612,16 @@ Conv: ${totalUsers? round((premium/totalUsers)*100,1):0}%
     }
   });
 
-  // Интервальный мониторинг (можно выключить на Free)
+  // Интервальный мониторинг (выключите на Free через DISABLE_INTERVALS=true)
   if (!DISABLE_INTERVALS) {
-    setInterval(()=>{ checkPositionsAndNotify().catch(()=>{}); }, 30*60*1000); // каждые 30 мин
+    setInterval(()=>{ checkPositionsAndNotify().catch(()=>{}); }, 30*60*1000);
   }
 
-  // ошибки
+  // Ошибки
   bot.on('error', e=>console.error('bot error:', e.response?.status || e.code || e.message));
 }
 
-// ------------ START SERVER ------------
+// ---------- START SERVER ----------
 app.listen(PORT, () => {
   console.log(`🚀 Server on ${PORT}`);
   console.log(`Mode: webhook${DISABLE_INTERVALS?' (intervals disabled)':''}`);
