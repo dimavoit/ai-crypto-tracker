@@ -45,7 +45,7 @@ const symbolMapping = {
   BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', ADA: 'cardano',
   DOT: 'polkadot', MATIC: 'matic-network', LINK: 'chainlink', UNI: 'uniswap',
   AVAX: 'avalanche-2', ATOM: 'cosmos', XRP: 'ripple', DOGE: 'dogecoin',
-  LTC: 'litecoin', BCH: 'bitcoin-cash', ONDO: 'ondo'
+  LTC: 'litecoin', BCH: 'bitcoin-cash', ONDO: 'ondo-finance'
 };
 const binancePair = {
   BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT', ADA: 'ADAUSDT',
