@@ -93,7 +93,7 @@ async function coinCapFallback(sym) {
   if (!id) return null;
   const now = Date.now(), start = now - 7*24*60*60*1000;
   const p = await axios.get(`https://api.coincap.io/v2/assets/${id}`);
-  const price = parseFloat(p.data?.data?.priceUsd);
+  const price = Float(p.data?.data?.priceUsd);
   if (!isFinite(price)) return null;
 
   const h = await axios.get(`https://api.coincap.io/v2/assets/${id}/history`, {
@@ -399,15 +399,30 @@ function calculatePositionSize(deposit, entryPrice, stopLoss, riskPercent = 4) {
 }
 
 // -----------------------------
-// INPUT PARSER (добавлен ONDO)
+// INPUT R (добавлен ONDO)
 // -----------------------------
 function parsePositionInput(text) {
-  const normalizedText = text.toLowerCase().replace(/[,.$]/g, ' ');
-  const symbolMatch = normalizedText.match(/\b(btc|eth|sol|ada|dot|matic|link|uni|avax|atom|xrp|doge|ltc|bch|ondo)\b/);
-  const directionMatch = normalizedText.match(/\b(long|short|лонг|шорт)\b/);
-  const priceMatch = normalizedText.match(/\b(\d+(?:\.\d+)?)\b/);
-  const depositMatch = normalizedText.match(/(?:депозит|deposit|деп)\s*(\d+(?:\.\d+)?)/);
-  const sizeMatch = normalizedText.match(/(?:размер|size|количество)\s*(\d+(?:\.\d+)?)/);
+  // 1) переводим запятую в точку; 2) убираем знак $; 3) нормализуем пробелы
+  const cleaned = text
+    .toLowerCase()
+    .replace(/,/g, '.')     // десятичные запятые -> точка
+    .replace(/\$/g, '')     // убрать $
+    .replace(/\s+/g, ' ')   // схлопнуть пробелы
+    .trim();
+
+  // ищем символ (добавлен ondo)
+  const symbolMatch = cleaned.match(/\b(btc|eth|sol|ada|dot|matic|link|uni|avax|atom|xrp|doge|ltc|bch|ondo)\b/);
+
+  // направление
+  const directionMatch = cleaned.match(/\b(long|short|лонг|шорт)\b/);
+
+  // цена (разрешаем форматы: 114000 | 212.67 | 0.7975)
+  const priceMatch = cleaned.match(/(\d+(?:\.\d+)?)/);
+
+  // депозит/размер
+  const depositMatch = cleaned.match(/(?:депозит|deposit|деп)\s*(\d+(?:\.\d+)?)/);
+  const sizeMatch = cleaned.match(/(?:размер|size|количество)\s*(\d+(?:\.\d+)?)/);
+
   return {
     symbol: symbolMatch ? symbolMatch[1].toUpperCase() : null,
     direction: directionMatch ? (/(long|лонг)/.test(directionMatch[1]) ? 'long' : 'short') : null,
